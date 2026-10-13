@@ -10,7 +10,7 @@ medical advice.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, time, timedelta
 from enum import Enum
 
 
@@ -56,6 +56,7 @@ class Segment:
 @dataclass
 class Session:
     day: date
+    run_time: time                  # taken from the matching available_days entry
     week: int                       # 1-based week of the plan
     type: SessionType
     segments: list[Segment]
@@ -69,7 +70,11 @@ class Session:
 class PlanRequest:
     goal: Goal
     start_date: date
-    available_days: set[int]        # 0 = Monday ... 6 = Sunday
+    # Maps weekday (0 = Monday ... 6 = Sunday) to the preferred run time on
+    # that day, so calendar events land at the right time around the user's
+    # existing schedule rather than each day sharing one fixed time.
+    # e.g. {1: time(7, 0), 5: time(18, 0)} = 7am Tuesdays, 6pm Saturdays.
+    available_days: dict[int, time]
     max_session_minutes: int = 90
     current_weekly_km: float = 0.0  # ignored for C25K
     race_date: date | None = None   # anchors the taper for distance goals
@@ -128,20 +133,71 @@ def validate_request(req: PlanRequest) -> list[str]:
     - current_weekly_km below the goal's prerequisite
     - race_date too soon for the plan length
     """
-    raise NotImplementedError
+    problems: list[str] = []
+    config = GOAL_CONFIGS[req.goal]
+
+    if len(req.available_days) < config.sessions_per_week:
+        problems.append(
+            f"{req.goal.value} needs {config.sessions_per_week} available days "
+            f"per week, but only {len(req.available_days)} were given."
+        )
+
+    return problems
+
+
+def _walk(minutes: float) -> Segment:
+    return Segment(Effort.WALK, minutes)
+
+def _run(minutes: float) -> Segment:
+    return Segment(Effort.EASY, minutes)
+
+# NHS Couch to 5K plan: https://www.nhs.uk/better-health/get-active/
+# get-running-with-couch-to-5k/couch-to-5k-running-plan/
+# Each week maps to exactly 3 run structures (one per session that week).
+# Most weeks repeat the same structure 3 times; weeks 5 and 6 do not.
+WEEK_STRUCTURES: dict[int, list[list[Segment]]] = {
+    1: [[_walk(5), *([_run(1), _walk(1.5)] * 7), _run(1), _walk(5)]] * 3,
+    2: [[_walk(5), *([_run(1.5), _walk(2)] * 5), _run(1.5), _walk(5)]] * 3,
+    3: [[_walk(5), _run(1.5), _walk(1.5), _run(3), _walk(3),
+         _run(1.5), _walk(1.5), _run(3), _walk(5)]] * 3,
+    4: [[_walk(5), _run(3), _walk(1.5), _run(5), _walk(2.5),
+         _run(3), _walk(1.5), _run(5), _walk(5)]] * 3,
+    5: [
+        [_walk(5), _run(5), _walk(3), _run(5), _walk(3), _run(5), _walk(5)],
+        [_walk(5), _run(8), _walk(5), _run(8), _walk(5)],
+        [_walk(5), _run(20), _walk(5)],
+    ],
+    6: [
+        [_walk(5), _run(5), _walk(3), _run(8), _walk(3), _run(5), _walk(5)],
+        [_walk(5), _run(10), _walk(3), _run(10), _walk(5)],
+        [_walk(5), _run(25), _walk(5)],
+    ],
+    7: [[_walk(5), _run(25), _walk(5)]] * 3,
+    8: [[_walk(5), _run(28), _walk(5)]] * 3,
+    9: [[_walk(5), _run(30), _walk(5)]] * 3,
+}
 
 
 def generate_plan(req: PlanRequest) -> Plan:
     """Build a full plan from a valid request. Pure: no I/O, no clock."""
-    raise NotImplementedError
+    config = GOAL_CONFIGS[req.goal]
+    total_sessions = config.weeks * config.sessions_per_week
 
+    sessions: list[Session] = []
+    current_date = req.start_date
 
-def replan(plan: Plan, today: date) -> Plan:
-    """Rebuild the remaining sessions after some were missed.
+    while len(sessions) < total_sessions:
+        weekday = current_date.weekday()
+        if weekday in req.available_days:
+            week_number = (len(sessions) // config.sessions_per_week) + 1
+            run_index_in_week = len(sessions) % config.sessions_per_week
+            sessions.append(Session(
+                day=current_date,
+                run_time=req.available_days[weekday],
+                week=week_number,
+                type=SessionType.WALK_RUN,
+                segments=WEEK_STRUCTURES[week_number][run_index_in_week],
+            ))
+        current_date += timedelta(days=1)
 
-    Principles:
-    - never cram a missed session into the next day
-    - several misses in a row -> step the plan back a week
-    - keep the taper anchored to race_date
-    """
-    raise NotImplementedError
+    return Plan(request=req, config=config, sessions=sessions)
