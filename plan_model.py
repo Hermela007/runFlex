@@ -9,7 +9,7 @@ medical advice.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, time, timedelta
 from enum import Enum
 
@@ -62,6 +62,7 @@ class Session:
     segments: list[Segment]
     distance_km: float | None = None  # None for C25K (time-based)
     status: Status = Status.PLANNED
+    is_repeat: bool = False         # True if replan inserted this as a repeated week
 
 
 # ---------------------------------------------------------------- input ----
@@ -148,13 +149,11 @@ def validate_request(req: PlanRequest) -> list[str]:
 def _walk(minutes: float) -> Segment:
     return Segment(Effort.WALK, minutes)
 
+
 def _run(minutes: float) -> Segment:
     return Segment(Effort.EASY, minutes)
 
-# NHS Couch to 5K plan: https://www.nhs.uk/better-health/get-active/
-# get-running-with-couch-to-5k/couch-to-5k-running-plan/
-# Each week maps to exactly 3 run structures (one per session that week).
-# Most weeks repeat the same structure 3 times; weeks 5 and 6 do not.
+
 WEEK_STRUCTURES: dict[int, list[list[Segment]]] = {
     1: [[_walk(5), *([_run(1), _walk(1.5)] * 7), _run(1), _walk(5)]] * 3,
     2: [[_walk(5), *([_run(1.5), _walk(2)] * 5), _run(1.5), _walk(5)]] * 3,
@@ -203,38 +202,161 @@ def generate_plan(req: PlanRequest) -> Plan:
     return Plan(request=req, config=config, sessions=sessions)
 
 
+# ---------------------------------------------------------------- replan ----
+
+def _next_available_dates(req: PlanRequest, start: date, count: int) -> list[date]:
+    """The next `count` dates on or after `start` that fall on an available weekday.
+
+    Assumes a validated request (enough available days), otherwise this
+    would loop forever.
+    """
+    dates: list[date] = []
+    cursor = start
+    while len(dates) < count:
+        if cursor.weekday() in req.available_days:
+            dates.append(cursor)
+        cursor += timedelta(days=1)
+    return dates
+
+
+def _sessions_by_week(plan: Plan) -> dict[int, list[Session]]:
+    """Sessions grouped by week number, each week in date order."""
+    grouped: dict[int, list[Session]] = {}
+    for s in plan.sessions:
+        grouped.setdefault(s.week, []).append(s)
+    for sessions in grouped.values():
+        sessions.sort(key=lambda s: s.day)
+    return grouped
+
+
+def _find_repeat(plan: Plan) -> tuple[int, list[int]] | None:
+    """Decide whether some week needs repeating.
+
+    Returns (after_week, weeks_to_copy) or None. The copies are inserted
+    right after `after_week`.
+
+    Rules:
+    - Every session in a week missed -> repeat that week.
+    - A week with 2 misses, then a miss in the following week (B):
+        * B's first session missed -> repeat the 2-miss week, then redo B
+        * otherwise -> repeat B
+    A trigger is skipped if the week after `after_week` was already inserted
+    by an earlier replan, so calling replan twice changes nothing.
+    """
+    per_week = plan.config.sessions_per_week
+    weeks = _sessions_by_week(plan)
+
+    def already_repeated(after_week: int) -> bool:
+        return any(s.is_repeat for s in weeks.get(after_week + 1, []))
+
+    for week in sorted(weeks):
+        sessions = weeks[week]
+        missed = sum(1 for s in sessions if s.status == Status.MISSED)
+
+        if missed >= per_week:
+            if not already_repeated(week):
+                return week, [week]
+            continue
+
+        following = weeks.get(week + 1)
+        if missed >= 2 and following and any(
+            s.status == Status.MISSED for s in following
+        ):
+            if already_repeated(week + 1):
+                continue
+            if following[0].status == Status.MISSED:
+                return week + 1, [week, week + 1]
+            return week + 1, [week + 1]
+
+    return None
+
+
+def _insert_repeats(
+    plan: Plan, after_week: int, copy_weeks: list[int], today: date
+) -> Plan:
+    """Insert fresh copies of `copy_weeks` after `after_week`.
+
+    - Sessions in `after_week` that haven't happened yet are dropped; the
+      repeat replaces them.
+    - Every later planned session moves back by len(copy_weeks) weeks.
+    """
+    req = plan.request
+    weeks = _sessions_by_week(plan)
+
+    dropped_ids = {id(s) for s in weeks[after_week] if s.status == Status.PLANNED}
+    later = sorted(
+        (s for s in plan.sessions if s.week > after_week and s.status == Status.PLANNED),
+        key=lambda s: (s.week, s.day),
+    )
+    later_ids = {id(s) for s in later}
+    kept = [
+        s for s in plan.sessions
+        if id(s) not in dropped_ids and id(s) not in later_ids
+    ]
+
+    templates = [(offset, s) for offset, w in enumerate(copy_weeks) for s in weeks[w]]
+    new_dates = _next_available_dates(req, today, len(templates) + len(later))
+
+    repeats = [
+        replace(
+            s,
+            day=d,
+            run_time=req.available_days[d.weekday()],
+            week=after_week + 1 + offset,
+            status=Status.PLANNED,
+            is_repeat=True,
+        )
+        for (offset, s), d in zip(templates, new_dates)
+    ]
+    shifted = [
+        replace(
+            s,
+            day=d,
+            run_time=req.available_days[d.weekday()],
+            week=s.week + len(copy_weeks),
+        )
+        for s, d in zip(later, new_dates[len(templates):])
+    ]
+    return replace(plan, sessions=kept + repeats + shifted)
+
+
 def replan(plan: Plan, today: date) -> Plan:
     """Rebuild the remaining sessions after some were missed.
 
-    Principles:
-    - never cram a missed session into the next day
-    - several misses in a row -> step the plan back a week
-    - keep the taper anchored to race_date
+    - Repeat weeks as described in _find_repeat.
+    - Otherwise, what's left of the current week shifts onto the next
+      available days.
+    Returns a new Plan; the input is never modified.
     """
     req = plan.request
 
-    # Find which week contains `today`, based on existing session dates.
-    current_week_sessions = [s for s in plan.sessions if s.day >= today]
-    if not current_week_sessions:
-        return plan  # nothing left to replan
+    while True:
+        found = _find_repeat(plan)
+        if found is None:
+            break
+        after_week, copy_weeks = found
+        plan = _insert_repeats(plan, after_week, copy_weeks, today)
 
-    target_week = min(s.week for s in current_week_sessions)
-    week_sessions = [s for s in plan.sessions if s.week == target_week]
+    upcoming = [s for s in plan.sessions if s.day >= today]
+    if not upcoming:
+        return plan
 
-    still_planned = [s for s in week_sessions
-                     if s.status == Status.PLANNED and s.day >= today]
+    target_week = min(s.week for s in upcoming)
+    still_planned = [
+        s for s in plan.sessions
+        if s.week == target_week and s.status == Status.PLANNED and s.day >= today
+    ]
+    new_dates = _next_available_dates(req, today, len(still_planned))
+    updates = {id(s): d for s, d in zip(still_planned, new_dates)}
 
-    # Walk forward from today, assigning the next available weekdays
-    # to the sessions still needing a date.
-    new_dates: list[date] = []
-    cursor = today
-    while len(new_dates) < len(still_planned):
-        if cursor.weekday() in req.available_days:
-            new_dates.append(cursor)
-        cursor += timedelta(days=1)
+    new_sessions = []
+    for s in plan.sessions:
+        if id(s) in updates:
+            d = updates[id(s)]
+            new_sessions.append(
+                replace(s, day=d, run_time=req.available_days[d.weekday()])
+            )
+        else:
+            new_sessions.append(s)
 
-    for session, new_date in zip(still_planned, new_dates):
-        session.day = new_date
-        session.run_time = req.available_days[new_date.weekday()]
-
-    return plan
+    return replace(plan, sessions=new_sessions)
