@@ -209,3 +209,61 @@ def test_save_and_load_plan_from_file(tmp_path):
     loaded = load_plan(path)
 
     assert loaded == plan
+
+
+def test_replan_on_the_missed_days_own_date_does_not_collide():
+    """Regression test: marking a session missed and replanning with
+    `today` equal to that session's own date must not reuse that date
+    for another session, even though the weekday itself is available.
+    """
+    request = PlanRequest(
+        goal=Goal.C25K,
+        start_date=date(2026, 10, 5),  # Monday
+        available_days={0: time(7, 0), 2: time(7, 0), 4: time(7, 0)},  # Mon/Wed/Fri
+    )
+    plan = generate_plan(request)
+
+    week_one = [s for s in plan.sessions if s.week == 1]
+    week_one[0].status = Status.MISSED  # Monday 10/5
+
+    updated = replan(plan, today=date(2026, 10, 5))  # same date as the miss
+
+    all_dates = [s.day for s in updated.sessions]
+    assert len(all_dates) == len(set(all_dates))  # no two sessions share a date
+
+    new_week_one = [s for s in updated.sessions if s.week == 1]
+    remaining = sorted(
+        s.day for s in new_week_one if s.status == Status.PLANNED
+    )
+    # The Wed/Fri sessions should be untouched, not shifted onto Monday
+    assert remaining == [date(2026, 10, 7), date(2026, 10, 9)]
+
+def test_overlapping_two_miss_triggers_in_one_replan_terminates():
+    """Regression test: logging several sessions before one replan call
+    (week 1: M M D, week 2: D M M, week 3 opens with a miss) satisfies two
+    2-miss rules at once. Applying the older one (repeat week 2 after week 2)
+    collided with week 3's already-logged miss, which kept its week number,
+    and the two rules then undid each other forever — replan never returned.
+    Only the latest rule should apply: repeat week 2, then a fresh week 3.
+    """
+    plan = make_plan()
+    by_week = lambda w: [s for s in plan.sessions if s.week == w]
+    week_one, week_two = by_week(1), by_week(2)
+    week_three_first = by_week(3)[0]
+    for s, status in zip(week_one + week_two + [week_three_first], "MMDDMMM"):
+        s.status = Status.MISSED if status == "M" else Status.DONE
+
+    updated = replan(plan, today=date(2026, 10, 19))  # Mon of week 3
+
+    assert sorted(set(s.week for s in updated.sessions)) == list(range(1, 12))
+    assert len(updated.sessions) == 31  # 27 - 2 dropped + 6 repeated
+    all_dates = [s.day for s in updated.sessions]
+    assert len(all_dates) == len(set(all_dates))
+
+    assert [s.status for s in updated.sessions if s.week == 3] == [Status.MISSED]
+    week_four = [s for s in updated.sessions if s.week == 4]  # week 2 again
+    assert [s.segments for s in week_four] == [s.segments for s in week_two]
+    assert week_four[0].day == date(2026, 10, 21)
+    week_five = [s for s in updated.sessions if s.week == 5]  # week 3 from scratch
+    assert len(week_five) == 3
+    assert week_five[0].segments == week_three_first.segments

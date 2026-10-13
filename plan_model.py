@@ -204,8 +204,17 @@ def generate_plan(req: PlanRequest) -> Plan:
 
 # ---------------------------------------------------------------- replan ----
 
-def _next_available_dates(req: PlanRequest, start: date, count: int) -> list[date]:
-    """The next `count` dates on or after `start` that fall on an available weekday.
+def _next_available_dates(
+    req: PlanRequest, start: date, count: int, exclude: frozenset[date] = frozenset()
+) -> list[date]:
+    """The next `count` dates on or after `start` that fall on an available
+    weekday and are not in `exclude`.
+
+    `exclude` must hold every date already used by a session that is staying
+    where it is — otherwise a newly picked date can collide with one of
+    those, double-booking the day. This matters even when `start` is itself
+    the date of a just-missed session: that weekday is still "available" in
+    general, but that specific date is already taken.
 
     Assumes a validated request (enough available days), otherwise this
     would loop forever.
@@ -213,7 +222,7 @@ def _next_available_dates(req: PlanRequest, start: date, count: int) -> list[dat
     dates: list[date] = []
     cursor = start
     while len(dates) < count:
-        if cursor.weekday() in req.available_days:
+        if cursor.weekday() in req.available_days and cursor not in exclude:
             dates.append(cursor)
         cursor += timedelta(days=1)
     return dates
@@ -242,6 +251,13 @@ def _find_repeat(plan: Plan) -> tuple[int, list[int]] | None:
         * otherwise -> repeat B
     A trigger is skipped if the week after `after_week` was already inserted
     by an earlier replan, so calling replan twice changes nothing.
+
+    A trigger is also skipped if any session after `after_week` has already
+    been logged (done/missed): the user has moved past that point, and those
+    sessions keep their week numbers, so inserting copies there would put two
+    different weeks under one number. This only happens when several sessions
+    are logged in one replan call; a later trigger then takes over. Without
+    this, two overlapping 2-miss triggers undo each other forever.
     """
     per_week = plan.config.sessions_per_week
     weeks = _sessions_by_week(plan)
@@ -249,12 +265,19 @@ def _find_repeat(plan: Plan) -> tuple[int, list[int]] | None:
     def already_repeated(after_week: int) -> bool:
         return any(s.is_repeat for s in weeks.get(after_week + 1, []))
 
+    def overtaken(after_week: int) -> bool:
+        return any(
+            s.status != Status.PLANNED
+            for w, sessions in weeks.items() if w > after_week
+            for s in sessions
+        )
+
     for week in sorted(weeks):
         sessions = weeks[week]
         missed = sum(1 for s in sessions if s.status == Status.MISSED)
 
         if missed >= per_week:
-            if not already_repeated(week):
+            if not already_repeated(week) and not overtaken(week):
                 return week, [week]
             continue
 
@@ -262,7 +285,7 @@ def _find_repeat(plan: Plan) -> tuple[int, list[int]] | None:
         if missed >= 2 and following and any(
             s.status == Status.MISSED for s in following
         ):
-            if already_repeated(week + 1):
+            if already_repeated(week + 1) or overtaken(week + 1):
                 continue
             if following[0].status == Status.MISSED:
                 return week + 1, [week, week + 1]
@@ -295,7 +318,8 @@ def _insert_repeats(
     ]
 
     templates = [(offset, s) for offset, w in enumerate(copy_weeks) for s in weeks[w]]
-    new_dates = _next_available_dates(req, today, len(templates) + len(later))
+    taken = frozenset(s.day for s in kept)
+    new_dates = _next_available_dates(req, today, len(templates) + len(later), exclude=taken)
 
     repeats = [
         replace(
@@ -346,7 +370,11 @@ def replan(plan: Plan, today: date) -> Plan:
         s for s in plan.sessions
         if s.week == target_week and s.status == Status.PLANNED and s.day >= today
     ]
-    new_dates = _next_available_dates(req, today, len(still_planned))
+    still_planned_ids = {id(s) for s in still_planned}
+    taken = frozenset(
+        s.day for s in plan.sessions if id(s) not in still_planned_ids
+    )
+    new_dates = _next_available_dates(req, today, len(still_planned), exclude=taken)
     updates = {id(s): d for s, d in zip(still_planned, new_dates)}
 
     new_sessions = []

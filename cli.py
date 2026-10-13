@@ -106,9 +106,19 @@ def mark_session_flow(plan):
     raw = input("\nWhich session number did you run or miss? ").strip()
     try:
         index = int(raw) - 1
+        if index < 0:  # "0" or "-1" would otherwise wrap to the end of the list
+            raise IndexError
         session = upcoming[index]
     except (ValueError, IndexError):
         print("  Not a valid session number.")
+        return plan
+    # replan uses the logged session's date as "today", so logging out of
+    # order would move "today" backwards and place repeats around sessions
+    # that are already logged.
+    if index != 0:
+        first = upcoming[0]
+        print(f"  Please log session 1 ({first.day}) first — sessions are "
+              f"logged in date order.")
         return plan
 
     outcome = input("Mark as (d)one or (m)issed? ").strip().lower()
