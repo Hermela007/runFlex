@@ -2,3 +2,6 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
+plan.json
+c25k_plan.ics
+sample_plan.ics

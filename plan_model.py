@@ -405,3 +405,94 @@ def export_plan(plan: Plan, path: str) -> None:
     """Write the plan's upcoming sessions to an .ics file at `path`."""
     with open(path, "w") as f:
         f.write(plan_to_ics(plan))
+
+
+# --------------------------------------------------------- serialization ----
+# Converts a Plan to/from plain JSON-safe dicts, so it can be saved to a
+# file between CLI runs. GoalConfig is not stored — it's small and fully
+# derived from the goal, so it's just looked up again from GOAL_CONFIGS.
+
+import json
+import os
+
+
+def _segment_to_dict(seg: Segment) -> dict:
+    return {"effort": seg.effort.value, "minutes": seg.minutes, "repeats": seg.repeats}
+
+
+def _segment_from_dict(d: dict) -> Segment:
+    return Segment(Effort(d["effort"]), d["minutes"], d.get("repeats", 1))
+
+
+def _session_to_dict(s: Session) -> dict:
+    return {
+        "day": s.day.isoformat(),
+        "run_time": s.run_time.isoformat(),
+        "week": s.week,
+        "type": s.type.value,
+        "segments": [_segment_to_dict(seg) for seg in s.segments],
+        "distance_km": s.distance_km,
+        "status": s.status.value,
+        "is_repeat": s.is_repeat,
+    }
+
+
+def _session_from_dict(d: dict) -> Session:
+    return Session(
+        day=date.fromisoformat(d["day"]),
+        run_time=time.fromisoformat(d["run_time"]),
+        week=d["week"],
+        type=SessionType(d["type"]),
+        segments=[_segment_from_dict(sd) for sd in d["segments"]],
+        distance_km=d.get("distance_km"),
+        status=Status(d["status"]),
+        is_repeat=d.get("is_repeat", False),
+    )
+
+
+def _request_to_dict(req: PlanRequest) -> dict:
+    return {
+        "goal": req.goal.value,
+        "start_date": req.start_date.isoformat(),
+        "available_days": {str(k): v.isoformat() for k, v in req.available_days.items()},
+        "max_session_minutes": req.max_session_minutes,
+        "current_weekly_km": req.current_weekly_km,
+        "race_date": req.race_date.isoformat() if req.race_date else None,
+    }
+
+
+def _request_from_dict(d: dict) -> PlanRequest:
+    return PlanRequest(
+        goal=Goal(d["goal"]),
+        start_date=date.fromisoformat(d["start_date"]),
+        available_days={int(k): time.fromisoformat(v) for k, v in d["available_days"].items()},
+        max_session_minutes=d.get("max_session_minutes", 90),
+        current_weekly_km=d.get("current_weekly_km", 0.0),
+        race_date=date.fromisoformat(d["race_date"]) if d.get("race_date") else None,
+    )
+
+
+def plan_to_dict(plan: Plan) -> dict:
+    return {
+        "request": _request_to_dict(plan.request),
+        "sessions": [_session_to_dict(s) for s in plan.sessions],
+    }
+
+
+def plan_from_dict(d: dict) -> Plan:
+    req = _request_from_dict(d["request"])
+    config = GOAL_CONFIGS[req.goal]
+    sessions = [_session_from_dict(sd) for sd in d["sessions"]]
+    return Plan(request=req, config=config, sessions=sessions)
+
+
+def save_plan(plan: Plan, path: str = "plan.json") -> None:
+    with open(path, "w") as f:
+        json.dump(plan_to_dict(plan), f, indent=2)
+
+
+def load_plan(path: str = "plan.json") -> Plan | None:
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return plan_from_dict(json.load(f))

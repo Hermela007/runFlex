@@ -179,3 +179,33 @@ def test_export_times_are_correct_in_utc_across_bst_and_gmt():
     )
     # Late in the plan the UK has switched to GMT (UTC+0) -> 7am UTC
     assert late_event.begin.to('utc').hour == 7
+
+
+def test_plan_survives_json_round_trip():
+    from plan_model import plan_to_dict, plan_from_dict
+
+    plan = make_plan()
+    week_one = [s for s in plan.sessions if s.week == 1]
+    week_one[0].status = Status.MISSED
+    week_one[1].status = Status.MISSED
+    week_one[2].status = Status.DONE
+    plan = replan(plan, today=date(2026, 10, 12))  # produces a repeated week
+
+    restored = plan_from_dict(plan_to_dict(plan))
+
+    assert restored == plan
+    assert restored.request.available_days == plan.request.available_days
+
+
+def test_save_and_load_plan_from_file(tmp_path):
+    from plan_model import save_plan, load_plan
+
+    plan = make_plan()
+    path = str(tmp_path / "plan.json")
+
+    assert load_plan(path) is None  # nothing saved yet
+
+    save_plan(plan, path)
+    loaded = load_plan(path)
+
+    assert loaded == plan
