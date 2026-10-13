@@ -267,3 +267,77 @@ def test_overlapping_two_miss_triggers_in_one_replan_terminates():
     week_five = [s for s in updated.sessions if s.week == 5]  # week 3 from scratch
     assert len(week_five) == 3
     assert week_five[0].segments == week_three_first.segments
+
+
+WEEKDAYS = {d: time(7, 0) for d in range(5)}  # Mon-Fri
+
+
+def _assert_spread_and_calendar_aligned(sessions):
+    """Each plan week sits inside one Mon-Sun calendar week, and no two
+    sessions in it fall on consecutive days."""
+    weeks = {}
+    for s in sessions:
+        weeks.setdefault(s.week, []).append(s.day)
+    for week, days in weeks.items():
+        days.sort()
+        assert len({d.isocalendar()[:2] for d in days}) == 1, (week, days)
+        gaps = [(b - a).days for a, b in zip(days, days[1:])]
+        assert min(gaps) >= 2, (week, days)
+
+
+def test_extra_available_days_are_spread_within_calendar_weeks():
+    """Regression test: with more than 3 available days, sessions were packed
+    onto the next consecutive available dates (Mon/Tue/Wed, Thu/Fri/Mon...),
+    giving no rest days and "weeks" that straddled calendar weeks.
+    """
+    plan = generate_plan(PlanRequest(
+        goal=Goal.C25K, start_date=date(2026, 10, 5), available_days=dict(WEEKDAYS)))
+
+    assert len(plan.sessions) == 27
+    _assert_spread_and_calendar_aligned(plan.sessions)
+    week_one = [s.day for s in plan.sessions if s.week == 1]
+    assert week_one == [date(2026, 10, 5), date(2026, 10, 7), date(2026, 10, 9)]
+    # Plan week n is calendar week n counted from the start date's week
+    for s in plan.sessions:
+        assert (s.day - date(2026, 10, 5)).days // 7 == s.week - 1
+
+
+def test_consecutive_available_days_fall_back_to_what_is_available():
+    """Only Mon/Tue/Wed free: there's no spread-out option, so use them."""
+    plan = generate_plan(PlanRequest(
+        goal=Goal.C25K, start_date=date(2026, 10, 5),
+        available_days={0: time(7, 0), 1: time(7, 0), 2: time(7, 0)}))
+    week_one = [s.day for s in plan.sessions if s.week == 1]
+    assert week_one == [date(2026, 10, 5), date(2026, 10, 6), date(2026, 10, 7)]
+
+
+def test_mid_week_start_begins_on_the_next_full_week():
+    """Starting on a Thursday leaves only Friday this week, so the plan
+    starts the following Monday rather than straddling two calendar weeks."""
+    plan = generate_plan(PlanRequest(
+        goal=Goal.C25K, start_date=date(2026, 10, 8), available_days=dict(WEEKDAYS)))
+    _assert_spread_and_calendar_aligned(plan.sessions)
+    assert plan.sessions[0].day == date(2026, 10, 12)
+
+
+def test_replan_with_extra_available_days_keeps_sessions_spread():
+    """Regression test: replan's date-picking had the same packing bug, so a
+    single miss pulled the rest of the week onto back-to-back days, and a
+    repeated week was packed onto consecutive days too."""
+    plan = generate_plan(PlanRequest(
+        goal=Goal.C25K, start_date=date(2026, 10, 5), available_days=dict(WEEKDAYS)))
+    plan.sessions[0].status = Status.MISSED  # Mon 10/5
+
+    shifted = replan(plan, today=date(2026, 10, 6))  # Tuesday
+    remaining = sorted(s.day for s in shifted.sessions
+                       if s.week == 1 and s.status == Status.PLANNED)
+    assert remaining == [date(2026, 10, 7), date(2026, 10, 9)]  # not Tue/Wed
+
+    for s in [s for s in plan.sessions if s.week == 1]:
+        s.status = Status.MISSED
+    repeated = replan(plan, today=date(2026, 10, 12))
+    all_dates = [s.day for s in repeated.sessions]
+    assert len(all_dates) == len(set(all_dates))
+    _assert_spread_and_calendar_aligned(
+        [s for s in repeated.sessions if s.status == Status.PLANNED])
+    assert replan(repeated, today=date(2026, 10, 12)) == repeated

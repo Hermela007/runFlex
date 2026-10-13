@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from enum import Enum
+from itertools import combinations
 
 
 # ---------------------------------------------------------------- enums ----
@@ -177,27 +178,51 @@ WEEK_STRUCTURES: dict[int, list[list[Segment]]] = {
 }
 
 
+def _training_weekdays(req: PlanRequest) -> tuple[int, ...]:
+    """The weekdays to actually run on, picked from req.available_days.
+
+    When more days are available than sessions_per_week, picks the most
+    spread-out set so there are rest days between runs: e.g. Mon-Fri gives
+    Mon/Wed/Fri, not Mon/Tue/Wed. The week is treated as a loop (Sunday's
+    run is followed by next Monday's), and options are ranked by their
+    smallest gap first, then the next smallest, and so on; ties go to the
+    earliest days. With exactly sessions_per_week days available there is
+    nothing to choose, so those days are used as-is — even if consecutive.
+    """
+    per_week = GOAL_CONFIGS[req.goal].sessions_per_week
+
+    def spread(days: tuple[int, ...]) -> tuple:
+        gaps = [b - a for a, b in zip(days, days[1:])] + [days[0] + 7 - days[-1]]
+        return tuple(sorted(gaps)), tuple(-d for d in days)
+
+    return max(combinations(sorted(req.available_days), per_week), key=spread)
+
+
 def generate_plan(req: PlanRequest) -> Plan:
-    """Build a full plan from a valid request. Pure: no I/O, no clock."""
+    """Build a full plan from a valid request. Pure: no I/O, no clock.
+
+    Plan week n is the nth Monday-Sunday calendar week, with its sessions on
+    the training weekdays. If the start date's own week has too few of those
+    days left, the plan starts the following Monday instead.
+    """
     config = GOAL_CONFIGS[req.goal]
-    total_sessions = config.weeks * config.sessions_per_week
+    weekdays = _training_weekdays(req)
+
+    monday = req.start_date - timedelta(days=req.start_date.weekday())
+    if sum(1 for d in weekdays if d >= req.start_date.weekday()) < config.sessions_per_week:
+        monday += timedelta(weeks=1)
 
     sessions: list[Session] = []
-    current_date = req.start_date
-
-    while len(sessions) < total_sessions:
-        weekday = current_date.weekday()
-        if weekday in req.available_days:
-            week_number = (len(sessions) // config.sessions_per_week) + 1
-            run_index_in_week = len(sessions) % config.sessions_per_week
+    for week_number in range(1, config.weeks + 1):
+        week_start = monday + timedelta(weeks=week_number - 1)
+        for run_index_in_week, weekday in enumerate(weekdays):
             sessions.append(Session(
-                day=current_date,
+                day=week_start + timedelta(days=weekday),
                 run_time=req.available_days[weekday],
                 week=week_number,
                 type=SessionType.WALK_RUN,
                 segments=WEEK_STRUCTURES[week_number][run_index_in_week],
             ))
-        current_date += timedelta(days=1)
 
     return Plan(request=req, config=config, sessions=sessions)
 
@@ -207,8 +232,8 @@ def generate_plan(req: PlanRequest) -> Plan:
 def _next_available_dates(
     req: PlanRequest, start: date, count: int, exclude: frozenset[date] = frozenset()
 ) -> list[date]:
-    """The next `count` dates on or after `start` that fall on an available
-    weekday and are not in `exclude`.
+    """The next `count` dates on or after `start` that fall on a training
+    weekday (see _training_weekdays) and are not in `exclude`.
 
     `exclude` must hold every date already used by a session that is staying
     where it is — otherwise a newly picked date can collide with one of
@@ -219,10 +244,11 @@ def _next_available_dates(
     Assumes a validated request (enough available days), otherwise this
     would loop forever.
     """
+    weekdays = _training_weekdays(req)
     dates: list[date] = []
     cursor = start
     while len(dates) < count:
-        if cursor.weekday() in req.available_days and cursor not in exclude:
+        if cursor.weekday() in weekdays and cursor not in exclude:
             dates.append(cursor)
         cursor += timedelta(days=1)
     return dates
