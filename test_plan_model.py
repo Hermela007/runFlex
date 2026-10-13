@@ -1,6 +1,6 @@
 from datetime import date, time
 from plan_model import (PlanRequest, Goal, validate_request, generate_plan,
-                        Effort, Status, replan)
+                        Effort, Status, replan, plan_to_ics, export_plan)
 
 DAYS = {0: time(7, 0), 2: time(7, 0), 4: time(7, 0)}  # Mon/Wed/Fri
 
@@ -125,3 +125,57 @@ def test_replan_is_idempotent():
     once = replan(plan, today=date(2026, 10, 15))
     twice = replan(once, today=date(2026, 10, 15))
     assert once == twice
+
+
+def test_export_produces_valid_ics_for_planned_sessions_only():
+    from ics import Calendar
+
+    plan = make_plan()
+    # Mark the very first session as done -> it should NOT appear in the export
+    plan.sessions[0].status = Status.DONE
+
+    ics_text = plan_to_ics(plan)
+
+    # It's valid .ics text the `ics` library can parse back
+    parsed = Calendar(ics_text)
+
+    planned_count = sum(1 for s in plan.sessions if s.status == Status.PLANNED)
+    assert len(parsed.events) == planned_count
+
+    titles = {e.name for e in parsed.events}
+    assert "C25K \u2014 Week 1" in titles
+
+    # Spot-check one event's timing and duration
+    first_planned = next(s for s in plan.sessions if s.status == Status.PLANNED)
+    matching = [e for e in parsed.events if e.begin.to('Europe/London').date() == first_planned.day]
+    assert len(matching) == 1
+    event = matching[0]
+    assert event.begin.to('Europe/London').time().hour == first_planned.run_time.hour
+    expected_minutes = sum(seg.minutes for seg in first_planned.segments)
+    assert event.duration.total_seconds() / 60 == expected_minutes
+
+
+def test_export_times_are_correct_in_utc_across_bst_and_gmt():
+    from ics import Calendar
+
+    # 5 Oct 2026 is BST (UTC+1); week 9 lands in late Nov/Dec, GMT (UTC+0)
+    request = PlanRequest(
+        goal=Goal.C25K,
+        start_date=date(2026, 10, 5),
+        available_days={0: time(7, 0), 2: time(7, 0), 4: time(7, 0)},
+    )
+    plan = generate_plan(request)
+    parsed = Calendar(plan_to_ics(plan))
+
+    week_one_event = next(
+        e for e in parsed.events if e.begin.date() == date(2026, 10, 5)
+    )
+    # 7am BST (UTC+1) on 5 Oct 2026 -> 6am UTC
+    assert week_one_event.begin.to('utc').hour == 6
+
+    late_session = next(s for s in plan.sessions if s.week == 9)
+    late_event = next(
+        e for e in parsed.events if e.begin.date() == late_session.day
+    )
+    # Late in the plan the UK has switched to GMT (UTC+0) -> 7am UTC
+    assert late_event.begin.to('utc').hour == 7

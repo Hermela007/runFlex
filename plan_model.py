@@ -10,7 +10,7 @@ medical advice.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import date, time, timedelta
+from datetime import date, datetime, time, timedelta
 from enum import Enum
 
 
@@ -360,3 +360,48 @@ def replan(plan: Plan, today: date) -> Plan:
             new_sessions.append(s)
 
     return replace(plan, sessions=new_sessions)
+
+
+# ------------------------------------------------------------- export -----
+
+def _format_segment(seg: Segment) -> str:
+    label = "Walk" if seg.effort == Effort.WALK else "Run"
+    minutes = int(seg.minutes) if seg.minutes == int(seg.minutes) else seg.minutes
+    return f"{label} {minutes} min"
+
+
+def plan_to_ics(plan: Plan, timezone: str = "Europe/London") -> str:
+    """Render the plan's upcoming sessions as .ics calendar text.
+
+    Only sessions still marked PLANNED are exported — done/missed sessions
+    are history, not something to add to a calendar. Times are attached to
+    `timezone` (and correctly converted to UTC on serialisation) so sessions
+    land at the right local time year-round, including across BST/GMT
+    changes, rather than being written out as naive/UTC times.
+    """
+    from zoneinfo import ZoneInfo
+    from ics import Calendar, Event
+
+    tz = ZoneInfo(timezone)
+    cal = Calendar()
+    for s in plan.sessions:
+        if s.status != Status.PLANNED:
+            continue
+
+        start = datetime.combine(s.day, s.run_time, tzinfo=tz)
+        duration_minutes = sum(seg.minutes for seg in s.segments)
+
+        event = Event()
+        event.name = f"C25K \u2014 Week {s.week}"
+        event.begin = start
+        event.duration = timedelta(minutes=duration_minutes)
+        event.description = ", ".join(_format_segment(seg) for seg in s.segments)
+        cal.events.add(event)
+
+    return cal.serialize()
+
+
+def export_plan(plan: Plan, path: str) -> None:
+    """Write the plan's upcoming sessions to an .ics file at `path`."""
+    with open(path, "w") as f:
+        f.write(plan_to_ics(plan))
