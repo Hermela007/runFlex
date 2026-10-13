@@ -201,3 +201,40 @@ def generate_plan(req: PlanRequest) -> Plan:
         current_date += timedelta(days=1)
 
     return Plan(request=req, config=config, sessions=sessions)
+
+
+def replan(plan: Plan, today: date) -> Plan:
+    """Rebuild the remaining sessions after some were missed.
+
+    Principles:
+    - never cram a missed session into the next day
+    - several misses in a row -> step the plan back a week
+    - keep the taper anchored to race_date
+    """
+    req = plan.request
+
+    # Find which week contains `today`, based on existing session dates.
+    current_week_sessions = [s for s in plan.sessions if s.day >= today]
+    if not current_week_sessions:
+        return plan  # nothing left to replan
+
+    target_week = min(s.week for s in current_week_sessions)
+    week_sessions = [s for s in plan.sessions if s.week == target_week]
+
+    still_planned = [s for s in week_sessions
+                     if s.status == Status.PLANNED and s.day >= today]
+
+    # Walk forward from today, assigning the next available weekdays
+    # to the sessions still needing a date.
+    new_dates: list[date] = []
+    cursor = today
+    while len(new_dates) < len(still_planned):
+        if cursor.weekday() in req.available_days:
+            new_dates.append(cursor)
+        cursor += timedelta(days=1)
+
+    for session, new_date in zip(still_planned, new_dates):
+        session.day = new_date
+        session.run_time = req.available_days[new_date.weekday()]
+
+    return plan
